@@ -3,584 +3,721 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-
-# ============================================================
-# SIMULATEUR HISTORIQUE - 500 € - 10 ANS
-# Stratégie : sélection quotidienne, arbitrages hebdomadaires,
-# conservation jusqu'au rang 15, filtre de tendance CAC 40.
-# AUCUN ordre réel n'est envoyé.
-# ============================================================
+import matplotlib.pyplot as plt
+from datetime import date
 
 st.set_page_config(
-    page_title="Backtest actions - stratégie optimisée",
+    page_title="Simulateur actions solides",
+    page_icon="📈",
     layout="wide"
 )
 
-CAPITAL_INITIAL = 500.0
-FRAIS = 0.001                 # 0,10 % par achat ou vente
-NB_ACTIONS = 10
-RANG_SORTIE = 15
-JOURS_ENTRE_ARBITRAGES = 5
-PERIODE = "10y"
+# =========================================================
+# 1. UNIVERS DES 20 ENTREPRISES
+# =========================================================
 
-ACTIONS = [
-    "AIR.PA", "OR.PA", "SAN.PA", "SU.PA", "BNP.PA",
-    "DG.PA", "AI.PA", "CAP.PA", "VIE.PA", "ORA.PA",
-    "ENGI.PA", "ACA.PA", "RNO.PA", "STLAM.PA", "GLE.PA",
-    "HO.PA", "RI.PA", "MC.PA", "KER.PA", "PUB.PA"
-]
+UNIVERS = {
+    "AIR.PA": "Airbus",
+    "OR.PA": "L'Oreal",
+    "MC.PA": "LVMH",
+    "RMS.PA": "Hermes",
+    "TTE.PA": "TotalEnergies",
+    "SU.PA": "Schneider Electric",
+    "AI.PA": "Air Liquide",
+    "SAN.PA": "Sanofi",
+    "BNP.PA": "BNP Paribas",
+    "DG.PA": "Vinci",
+    "CAP.PA": "Capgemini",
+    "SAF.PA": "Safran",
+    "DSY.PA": "Dassault Systemes",
+    "EL.PA": "EssilorLuxottica",
+    "ENGI.PA": "Engie",
+    "RI.PA": "Pernod Ricard",
+    "ASML.AS": "ASML",
+    "SAP.DE": "SAP",
+    "SIE.DE": "Siemens",
+    "ALV.DE": "Allianz"
+}
 
-CAC40 = "^FCHI"
-
-
-# ------------------------------------------------------------
-# EXTRACTION ROBUSTE DES COURS YAHOO FINANCE
-# ------------------------------------------------------------
-
-def extraire_clotures(data):
-    if data is None or data.empty:
-        raise ValueError("Aucune donnée reçue de Yahoo Finance.")
-
-    if isinstance(data.columns, pd.MultiIndex):
-        niveaux = [
-            list(data.columns.get_level_values(0)),
-            list(data.columns.get_level_values(1))
-        ]
-
-        if "Close" in niveaux[0]:
-            close = data["Close"]
-        elif "Close" in niveaux[1]:
-            close = data.xs("Close", axis=1, level=1)
-        else:
-            raise ValueError("Colonne Close introuvable dans les données.")
-
-    else:
-        if "Close" not in data.columns:
-            raise ValueError("Colonne Close introuvable.")
-        close = data["Close"]
-
-    if isinstance(close, pd.Series):
-        close = close.to_frame()
-
-    close = close.copy()
-    close = close.apply(pd.to_numeric, errors="coerce")
-    close = close.replace([np.inf, -np.inf], np.nan)
-
-    return close
+BENCHMARK = "^FCHI"
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def telecharger_donnees():
-    donnees_actions = yf.download(
-        ACTIONS,
-        period=PERIODE,
-        interval="1d",
+# =========================================================
+# 2. PARAMETRES
+# =========================================================
+
+st.title("Simulateur de stratégie actions")
+
+st.write(
+    "Sélection d'entreprises solides, conservation des positions "
+    "jusqu'à un bénéfice net après frais, puis réinvestissement."
+)
+
+with st.sidebar:
+    st.header("Paramètres")
+
+    capital_initial = st.number_input(
+        "Capital initial (€)",
+        min_value=100.0,
+        value=500.0,
+        step=50.0
+    )
+
+    frais_achat = st.number_input(
+        "Frais par achat (€)",
+        min_value=0.0,
+        value=1.0,
+        step=0.25
+    )
+
+    frais_vente = st.number_input(
+        "Frais par vente (€)",
+        min_value=0.0,
+        value=1.0,
+        step=0.25
+    )
+
+    benefice_min = st.number_input(
+        "Bénéfice net minimum par vente (€)",
+        min_value=0.0,
+        value=0.10,
+        step=0.05
+    )
+
+    nb_positions = st.slider(
+        "Nombre maximal d'actions détenues",
+        1, 10, 5
+    )
+
+    duree = st.slider(
+        "Durée du backtest (années)",
+        3, 15, 10
+    )
+
+    date_fin = st.date_input(
+        "Date de fin",
+        value=date.today()
+    )
+
+    lancer = st.button(
+        "LANCER LE BACKTEST",
+        type="primary",
+        use_container_width=True
+    )
+
+
+# =========================================================
+# 3. TELECHARGEMENT DES COURS
+# =========================================================
+
+@st.cache_data(ttl=3600)
+def telecharger_cours(tickers, debut, fin):
+
+    donnees = yf.download(
+        list(tickers),
+        start=debut,
+        end=fin,
         auto_adjust=True,
         progress=False,
-        group_by="column",
+        group_by="ticker",
         threads=True
     )
 
-    cours = extraire_clotures(donnees_actions)
-    cours = cours.reindex(columns=ACTIONS)
-    cours = cours.dropna(axis=1, how="all")
-    cours = cours.sort_index()
+    if donnees is None or donnees.empty:
+        raise ValueError("Aucun cours reçu de Yahoo Finance.")
 
-    donnees_cac = yf.download(
-        CAC40,
-        period=PERIODE,
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        threads=False
-    )
+    resultats = {}
 
-    cac = extraire_clotures(donnees_cac)
-    cac = cac.iloc[:, 0].rename("CAC40")
+    if isinstance(donnees.columns, pd.MultiIndex):
 
-    return cours, cac
+        for ticker in tickers:
 
+            if ticker in donnees.columns.get_level_values(0):
+                bloc = donnees[ticker]
 
-# ------------------------------------------------------------
-# INDICATEURS DE SELECTION
-# ------------------------------------------------------------
+            elif ticker in donnees.columns.get_level_values(1):
+                bloc = donnees.xs(
+                    ticker,
+                    axis=1,
+                    level=1
+                )
 
-def calculer_scores(cours):
-    rendements = cours.pct_change(fill_method=None)
+            else:
+                continue
 
-    momentum_20 = cours / cours.shift(20) - 1
-    momentum_120 = cours / cours.shift(120) - 1
+            if "Close" in bloc.columns:
+                resultats[ticker] = bloc["Close"]
 
-    volatilite_20 = (
-        rendements
-        .rolling(20)
-        .std()
-        * np.sqrt(252)
-    )
-
-    # Même formule de sélection que dans le backtest précédent
-    scores = (
-        0.60 * momentum_20
-        + 0.40 * momentum_120
-        - 0.50 * volatilite_20
-    )
-
-    return scores
-
-
-# ------------------------------------------------------------
-# CALCUL DES INDICATEURS DE PERFORMANCE
-# ------------------------------------------------------------
-
-def calculer_indicateurs(capital):
-    capital = capital.dropna()
-
-    if len(capital) < 2:
-        return {}
-
-    rendement_total = capital.iloc[-1] / CAPITAL_INITIAL - 1
-
-    duree_annees = (
-        (capital.index[-1] - capital.index[0]).days / 365.25
-    )
-
-    if duree_annees > 0 and capital.iloc[-1] > 0:
-        rendement_annuel = (
-            (capital.iloc[-1] / CAPITAL_INITIAL)
-            ** (1 / duree_annees) - 1
-        )
     else:
-        rendement_annuel = np.nan
 
-    drawdown = capital / capital.cummax() - 1
-    perte_max = drawdown.min()
+        if "Close" in donnees.columns and len(tickers) == 1:
+            resultats[tickers[0]] = donnees["Close"]
 
-    rendements_journaliers = capital.pct_change().dropna()
+    if not resultats:
+        raise ValueError(
+            "Impossible de récupérer les cours de clôture."
+        )
+
+    prix = pd.concat(resultats, axis=1)
+    prix.columns = list(resultats.keys())
+
+    prix = prix.sort_index()
+    prix = prix[~prix.index.duplicated(keep="last")]
+    prix = prix.replace([np.inf, -np.inf], np.nan)
+
+    return prix
+
+
+# =========================================================
+# 4. CLASSEMENT DES ENTREPRISES
+# =========================================================
+
+def calculer_scores(prix):
+
+    rendement_3_mois = prix / prix.shift(63) - 1
+    rendement_6_mois = prix / prix.shift(126) - 1
+
+    moyenne_200 = prix.rolling(200).mean()
 
     volatilite = (
-        rendements_journaliers.std() * np.sqrt(252)
-        if len(rendements_journaliers) > 1 else np.nan
+        prix.pct_change()
+        .rolling(20)
+        .std()
+        * np.sqrt(20)
     )
 
-    rendement_moyen = rendements_journaliers.mean() * 252
-    ratio_sharpe = (
-        rendement_moyen / volatilite
-        if pd.notna(volatilite) and volatilite > 0 else np.nan
+    score = (
+        0.45 * rendement_3_mois
+        + 0.55 * rendement_6_mois
+        - 0.25 * volatilite
     )
 
-    return {
-        "capital_final": capital.iloc[-1],
-        "gain": capital.iloc[-1] - CAPITAL_INITIAL,
-        "rendement_total": rendement_total,
-        "rendement_annuel": rendement_annuel,
-        "perte_max": perte_max,
-        "volatilite": volatilite,
-        "sharpe": ratio_sharpe
-    }
+    # On privilégie les actions en tendance positive.
+    score = score.where(prix > moyenne_200)
+    score = score.where(rendement_3_mois > 0)
+    score = score.where(rendement_6_mois > 0)
+
+    # Décalage d'une séance pour éviter d'utiliser le futur.
+    return score.shift(1)
 
 
-# ------------------------------------------------------------
-# BACKTEST AVEC ARBITRAGES LIMITES
-# ------------------------------------------------------------
+# =========================================================
+# 5. MOTEUR DU BACKTEST
+# =========================================================
 
-def lancer_backtest(cours, cac, filtre_tendance=True):
-    cours = cours.copy().sort_index()
-    cac = cac.copy().sort_index()
+def executer_backtest(
+    prix,
+    capital,
+    frais_buy,
+    frais_sell,
+    marge,
+    max_positions
+):
 
-    # On garde uniquement les actions disposant de suffisamment
-    # de données pour calculer les indicateurs.
-    scores = calculer_scores(cours)
+    scores = calculer_scores(prix)
 
-    cac_aligne = cac.reindex(cours.index).ffill()
-    moyenne_cac_200 = cac_aligne.rolling(200).mean()
+    cash = float(capital)
+    positions = {}
 
-    # Il faut au moins 120 jours d'historique.
-    debut = 121
+    transactions = []
+    historique = []
 
-    if filtre_tendance:
-        debut = max(debut, 201)
+    debut = 210
 
-    if len(cours) <= debut + 5:
-        raise ValueError("Historique insuffisant pour le backtest.")
+    if len(prix) <= debut:
+        raise ValueError(
+            "Pas assez de données historiques."
+        )
 
-    tresorerie = CAPITAL_INITIAL
-    portefeuille = {}  # ticker -> nombre d'actions détenues
+    for i in range(debut, len(prix)):
 
-    frais_cumules = 0.0
-    nombre_achats = 0
-    nombre_ventes = 0
+        jour = prix.index[i]
+        cours_jour = prix.iloc[i]
+        score_jour = scores.iloc[i]
 
-    historique_capital = []
-    historique_tresorerie = []
-    historique_positions = []
+        # -------------------------------------------------
+        # A. VENTES : UNIQUEMENT SI BENEFICE NET SUFFISANT
+        # -------------------------------------------------
 
-    dates = cours.index
+        ventes_du_jour = []
 
-    for i in range(debut, len(dates)):
-        date = dates[i]
+        for ticker, position in list(positions.items()):
 
-        # Cours de clôture du jour
-        prix_du_jour = cours.loc[date]
+            cours = cours_jour.get(ticker, np.nan)
 
-        # Valeur du portefeuille avant les arbitrages du jour
-        valeur_positions = 0.0
+            if pd.isna(cours) or cours <= 0:
+                continue
 
-        for ticker, quantite in portefeuille.items():
-            prix = prix_du_jour.get(ticker, np.nan)
-            if pd.notna(prix) and prix > 0:
-                valeur_positions += quantite * float(prix)
+            montant_vente = (
+                position["quantite"] * float(cours)
+                - frais_sell
+            )
 
-        valeur_totale = tresorerie + valeur_positions
+            benefice_net = (
+                montant_vente
+                - position["cout_total"]
+            )
 
-        # Arbitrage seulement tous les 5 jours de bourse.
-        jour_arbitrage = ((i - debut) % JOURS_ENTRE_ARBITRAGES == 0)
+            if benefice_net >= marge:
+                ventes_du_jour.append(
+                    (ticker, float(cours), montant_vente,
+                     benefice_net)
+                )
 
-        if jour_arbitrage:
-            scores_du_jour = scores.loc[date].dropna()
-            classement = scores_du_jour.sort_values(
+        titres_vendus_aujourdhui = set()
+
+        for ticker, cours, montant_vente, benefice in ventes_du_jour:
+
+            position = positions.pop(ticker)
+
+            cash += montant_vente
+            titres_vendus_aujourdhui.add(ticker)
+
+            transactions.append({
+                "Date": jour,
+                "Type": "VENTE",
+                "Ticker": ticker,
+                "Entreprise": UNIVERS.get(ticker, ticker),
+                "Cours": cours,
+                "Quantite": position["quantite"],
+                "Frais": frais_sell,
+                "Benefice net": benefice,
+                "Tresorerie": cash
+            })
+
+        # -------------------------------------------------
+        # B. NOUVEAUX ACHATS APRES RECLASSEMENT
+        # -------------------------------------------------
+
+        while len(positions) < max_positions:
+
+            places_libres = max_positions - len(positions)
+
+            if places_libres <= 0:
+                break
+
+            # Répartition de la trésorerie entre les places libres.
+            budget = cash / places_libres
+
+            if budget <= frais_buy:
+                break
+
+            candidats = score_jour.dropna()
+
+            candidats = candidats[
+                ~candidats.index.isin(positions.keys())
+            ]
+
+            candidats = candidats[
+                ~candidats.index.isin(titres_vendus_aujourdhui)
+            ]
+
+            candidats = candidats.sort_values(
                 ascending=False
             )
 
-            top_10 = list(classement.head(NB_ACTIONS).index)
-            rangs = {
-                ticker: rang
-                for rang, ticker in enumerate(classement.index, start=1)
-            }
+            if candidats.empty:
+                break
 
-            # Filtre de tendance : CAC 40 au-dessus de sa moyenne
-            # mobile 200 jours.
-            marche_favorable = True
+            achat_effectue = False
 
-            if filtre_tendance:
-                niveau_cac = cac_aligne.loc[date]
-                moyenne = moyenne_cac_200.loc[date]
+            for ticker, score in candidats.items():
 
-                marche_favorable = (
-                    pd.notna(niveau_cac)
-                    and pd.notna(moyenne)
-                    and niveau_cac >= moyenne
-                )
+                cours = cours_jour.get(ticker, np.nan)
 
-            if not marche_favorable:
-                # Passage en liquidités lorsque le filtre est négatif.
-                cibles = []
-            else:
-                # On conserve les actions déjà détenues si elles
-                # restent dans les 15 premières.
-                conservees = []
-
-                for ticker in portefeuille:
-                    if rangs.get(ticker, 999) <= RANG_SORTIE:
-                        conservees.append(ticker)
-
-                # On complète avec les meilleures actions disponibles.
-                cibles = conservees.copy()
-
-                for ticker in top_10:
-                    if ticker not in cibles and len(cibles) < NB_ACTIONS:
-                        cibles.append(ticker)
-
-            # VENTES : uniquement des actions qui ne sont plus retenues.
-            a_vendre = [
-                ticker for ticker in portefeuille
-                if ticker not in cibles
-            ]
-
-            for ticker in a_vendre:
-                prix = prix_du_jour.get(ticker, np.nan)
-
-                if pd.notna(prix) and prix > 0:
-                    montant = portefeuille[ticker] * float(prix)
-                    commission = montant * FRAIS
-
-                    tresorerie += montant - commission
-                    frais_cumules += commission
-                    nombre_ventes += 1
-
-                del portefeuille[ticker]
-
-            # ACHATS : on utilise la trésorerie disponible pour
-            # remplir les places vacantes, sans vendre les gagnantes
-            # pour rééquilibrer artificiellement les poids.
-            nouvelles = [
-                ticker for ticker in cibles
-                if ticker not in portefeuille
-            ]
-
-            for position in range(len(nouvelles)):
-                ticker = nouvelles[position]
-                places_restantes = len(nouvelles) - position
-
-                prix = prix_du_jour.get(ticker, np.nan)
-
-                if pd.isna(prix) or prix <= 0 or tresorerie <= 0:
+                if pd.isna(cours) or cours <= 0:
                     continue
 
-                budget = tresorerie / places_restantes
-                montant_achat = budget / (1 + FRAIS)
-                commission = montant_achat * FRAIS
+                montant_depense = min(budget, cash)
+                montant_investi = montant_depense - frais_buy
 
-                quantite = montant_achat / float(prix)
-                cout_total = montant_achat + commission
+                if montant_investi <= 0:
+                    continue
 
-                if cout_total <= tresorerie:
-                    portefeuille[ticker] = quantite
-                    tresorerie -= cout_total
-                    frais_cumules += commission
-                    nombre_achats += 1
+                quantite = montant_investi / float(cours)
 
-        # Valorisation après arbitrages et commissions.
-        valeur_positions = 0.0
+                positions[ticker] = {
+                    "quantite": quantite,
+                    "cout_total": montant_depense,
+                    "date_achat": jour,
+                    "cours_achat": float(cours)
+                }
 
-        for ticker, quantite in portefeuille.items():
-            prix = prix_du_jour.get(ticker, np.nan)
+                cash -= montant_depense
 
-            if pd.notna(prix) and prix > 0:
-                valeur_positions += quantite * float(prix)
+                transactions.append({
+                    "Date": jour,
+                    "Type": "ACHAT",
+                    "Ticker": ticker,
+                    "Entreprise": UNIVERS.get(ticker, ticker),
+                    "Cours": float(cours),
+                    "Quantite": quantite,
+                    "Frais": frais_buy,
+                    "Benefice net": np.nan,
+                    "Tresorerie": cash
+                })
 
-        valeur_totale = tresorerie + valeur_positions
+                achat_effectue = True
+                break
 
-        historique_capital.append((date, valeur_totale))
-        historique_tresorerie.append((date, tresorerie))
-        historique_positions.append((date, len(portefeuille)))
+            if not achat_effectue:
+                break
 
-    capital = pd.Series(
-        dict(historique_capital),
-        name="Stratégie optimisée"
+        # -------------------------------------------------
+        # C. VALORISATION DU PORTEFEUILLE
+        # -------------------------------------------------
+
+        valeur_actions = 0.0
+
+        for ticker, position in positions.items():
+
+            cours = cours_jour.get(ticker, np.nan)
+
+            if pd.isna(cours):
+                continue
+
+            valeur_actions += (
+                position["quantite"] * float(cours)
+            )
+
+        valeur_totale = cash + valeur_actions
+
+        historique.append({
+            "Date": jour,
+            "Capital": valeur_totale,
+            "Tresorerie": cash,
+            "Valeur actions": valeur_actions,
+            "Nombre positions": len(positions)
+        })
+
+    # =====================================================
+    # 6. RESULTATS
+    # =====================================================
+
+    courbe = pd.DataFrame(historique).set_index("Date")
+
+    transactions_df = pd.DataFrame(transactions)
+
+    valeur_finale = float(courbe["Capital"].iloc[-1])
+
+    gain = valeur_finale - capital
+
+    performance = valeur_finale / capital - 1
+
+    jours = max(
+        (courbe.index[-1] - courbe.index[0]).days,
+        1
     )
 
-    tresorerie_historique = pd.Series(
-        dict(historique_tresorerie),
-        name="Trésorerie"
+    rendement_annuel = (
+        (valeur_finale / capital) ** (365.25 / jours) - 1
+        if valeur_finale > 0 else -1
     )
 
-    positions_historique = pd.Series(
-        dict(historique_positions),
-        name="Nombre de positions"
+    sommet = courbe["Capital"].cummax()
+
+    drawdown = courbe["Capital"] / sommet - 1
+
+    perte_max = float(drawdown.min())
+
+    total_frais = (
+        transactions_df["Frais"].fillna(0).sum()
+        if not transactions_df.empty else 0
     )
 
-    # Comparaison avec le CAC 40 sur les mêmes dates.
-    cac_comparable = cac_aligne.reindex(capital.index).dropna()
+    achats = (
+        transactions_df[transactions_df["Type"] == "ACHAT"]
+        if not transactions_df.empty else pd.DataFrame()
+    )
 
-    dates_communes = capital.index.intersection(cac_comparable.index)
-    capital = capital.reindex(dates_communes)
-    cac_comparable = cac_comparable.reindex(dates_communes)
+    ventes = (
+        transactions_df[transactions_df["Type"] == "VENTE"]
+        if not transactions_df.empty else pd.DataFrame()
+    )
 
-    if len(cac_comparable) > 1:
-        benchmark = (
-            CAPITAL_INITIAL
-            * cac_comparable / cac_comparable.iloc[0]
+    benefices_realises = (
+        ventes["Benefice net"].sum()
+        if not ventes.empty else 0
+    )
+
+    # -----------------------------------------------------
+    # POSITIONS ENCORE DETENUES A LA FIN
+    # -----------------------------------------------------
+
+    positions_finales = []
+
+    for ticker, position in positions.items():
+
+        cours = prix[ticker].dropna().iloc[-1]
+
+        valeur = position["quantite"] * float(cours)
+
+        gain_latent = (
+            valeur
+            - frais_sell
+            - position["cout_total"]
         )
-        benchmark.name = "CAC 40"
-    else:
-        benchmark = pd.Series(dtype=float)
+
+        seuil_vente = (
+            position["cout_total"]
+            + frais_sell
+            + marge
+        ) / position["quantite"]
+
+        positions_finales.append({
+            "Entreprise": UNIVERS.get(ticker, ticker),
+            "Ticker": ticker,
+            "Date achat": position["date_achat"].date(),
+            "Prix achat": position["cours_achat"],
+            "Dernier cours": float(cours),
+            "Seuil vente": seuil_vente,
+            "Gain latent net": gain_latent
+        })
 
     return {
-        "capital": capital,
-        "benchmark": benchmark,
-        "tresorerie": tresorerie_historique.reindex(dates_communes),
-        "positions": positions_historique.reindex(dates_communes),
-        "frais": frais_cumules,
-        "achats": nombre_achats,
-        "ventes": nombre_ventes,
-        "portefeuille": portefeuille
+        "courbe": courbe,
+        "transactions": transactions_df,
+        "positions": pd.DataFrame(positions_finales),
+        "valeur_finale": valeur_finale,
+        "gain": gain,
+        "performance": performance,
+        "rendement_annuel": rendement_annuel,
+        "perte_max": perte_max,
+        "total_frais": total_frais,
+        "nb_achats": len(achats),
+        "nb_ventes": len(ventes),
+        "benefices_realises": benefices_realises
     }
 
 
-# ------------------------------------------------------------
-# INTERFACE STREAMLIT
-# ------------------------------------------------------------
+# =========================================================
+# 7. EXECUTION ET AFFICHAGE
+# =========================================================
 
-st.title("Backtest actions - stratégie optimisée")
+if lancer:
 
-st.write(
-    "Simulation historique sur 10 ans avec 500 € de départ. "
-    "Les opérations sont fictives : aucun ordre réel n'est transmis."
-)
+    fin = pd.Timestamp(date_fin)
 
-st.sidebar.header("Paramètres")
+    debut = (
+        fin
+        - pd.DateOffset(years=duree)
+        - pd.Timedelta(days=400)
+    )
 
-filtre_tendance = st.sidebar.checkbox(
-    "Activer le filtre de tendance CAC 40 (200 jours)",
-    value=True
-)
+    fin_telechargement = (
+        fin + pd.Timedelta(days=1)
+    ).strftime("%Y-%m-%d")
 
-st.sidebar.write("Capital initial : 500 €")
-st.sidebar.write("Nombre maximal d'actions : 10")
-st.sidebar.write("Arbitrage : tous les 5 jours de bourse")
-st.sidebar.write("Commission : 0,10 % par opération")
+    try:
 
-if st.button("Lancer le backtest", type="primary"):
-    st.cache_data.clear()
+        with st.spinner(
+            "Téléchargement des cours et calcul du backtest..."
+        ):
 
-try:
-    with st.spinner("Téléchargement des cours et calcul du backtest..."):
-        cours, cac = telecharger_donnees()
-
-        if cours.shape[1] < 10:
-            st.error(
-                "Moins de 10 actions disposent de données suffisantes. "
-                "Vérifie les données Yahoo Finance."
+            prix = telecharger_cours(
+                tuple(UNIVERS.keys()),
+                debut.strftime("%Y-%m-%d"),
+                fin_telechargement
             )
-            st.stop()
 
-        resultat = lancer_backtest(
-            cours,
-            cac,
-            filtre_tendance=filtre_tendance
+            prix = prix.dropna(
+                axis=1,
+                thresh=max(250, int(len(prix) * 0.55))
+            )
+
+            if prix.shape[1] < 5:
+                raise ValueError(
+                    "Moins de cinq actions disposent de suffisamment de données."
+                )
+
+            resultat = executer_backtest(
+                prix,
+                capital_initial,
+                frais_achat,
+                frais_vente,
+                benefice_min,
+                nb_positions
+            )
+
+        st.success("Backtest terminé.")
+
+        st.subheader("Résultats principaux")
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "Capital final",
+            f'{resultat["valeur_finale"]:.2f} €'
         )
 
-    capital = resultat["capital"]
-    benchmark = resultat["benchmark"]
-
-    if capital.empty:
-        st.error("Le backtest n'a produit aucun résultat.")
-        st.stop()
-
-    indicateurs = calculer_indicateurs(capital)
-    indicateurs_cac = calculer_indicateurs(benchmark)
-
-    st.subheader("Résultats de la stratégie")
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "Capital final",
-        f"{indicateurs['capital_final']:.2f} €"
-    )
-
-    c2.metric(
-        "Gain net",
-        f"{indicateurs['gain']:.2f} €"
-    )
-
-    c3.metric(
-        "Rendement annualisé",
-        f"{indicateurs['rendement_annuel'] * 100:.2f} %"
-    )
-
-    c4.metric(
-        "Perte maximale",
-        f"{indicateurs['perte_max'] * 100:.2f} %"
-    )
-
-    st.subheader("Comparaison avec le CAC 40")
-
-    if not benchmark.empty:
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
-            "Notre stratégie",
-            f"{capital.iloc[-1]:.2f} €"
+        c2.metric(
+            "Gain / perte",
+            f'{resultat["gain"]:.2f} €'
         )
 
-        col2.metric(
-            "CAC 40",
-            f"{benchmark.iloc[-1]:.2f} €"
+        c3.metric(
+            "Performance totale",
+            f'{resultat["performance"]:.2%}'
         )
 
-        col3.metric(
-            "Écart",
-            f"{capital.iloc[-1] - benchmark.iloc[-1]:+.2f} €"
+        c4.metric(
+            "Rendement annualisé",
+            f'{resultat["rendement_annuel"]:.2%}'
         )
 
-        graphique = pd.concat(
-            [capital, benchmark],
-            axis=1
-        ).dropna()
+        c5, c6, c7, c8 = st.columns(4)
 
-        st.line_chart(graphique)
-
-    st.subheader("Évolution du portefeuille")
-
-    st.line_chart(
-        pd.DataFrame({
-            "Valeur totale (€)": capital,
-            "Trésorerie (€)": resultat["tresorerie"]
-        })
-    )
-
-    st.subheader("Risque et frais")
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric(
-        "Frais cumulés",
-        f"{resultat['frais']:.2f} €"
-    )
-
-    col2.metric(
-        "Achats",
-        resultat["achats"]
-    )
-
-    col3.metric(
-        "Ventes",
-        resultat["ventes"]
-    )
-
-    col4.metric(
-        "Ratio de Sharpe",
-        f"{indicateurs['sharpe']:.2f}"
-        if pd.notna(indicateurs["sharpe"]) else "N/D"
-    )
-
-    st.subheader("Nombre d'actions détenues")
-
-    st.line_chart(resultat["positions"])
-
-    st.subheader("Dernières positions détenues")
-
-    dernier_jour = cours.index[-1]
-    lignes = []
-
-    for ticker, quantite in resultat["portefeuille"].items():
-        prix = cours[ticker].dropna().iloc[-1]
-        valeur = quantite * float(prix)
-
-        lignes.append({
-            "Action": ticker,
-            "Quantité": round(quantite, 5),
-            "Dernier cours": round(float(prix), 2),
-            "Valeur estimée": round(valeur, 2)
-        })
-
-    if lignes:
-        tableau = pd.DataFrame(lignes)
-        st.dataframe(tableau, use_container_width=True)
-    else:
-        st.info("Le portefeuille est actuellement en liquidités.")
-
-    st.subheader("Performance annuelle")
-
-    annuel = capital.resample("YE").last()
-    annuel = annuel.pct_change()
-
-    if len(annuel) > 0:
-        premier_rendement = (
-            capital.iloc[0] / CAPITAL_INITIAL - 1
+        c5.metric(
+            "Perte maximale",
+            f'{resultat["perte_max"]:.2%}'
         )
-        annuel.iloc[0] = premier_rendement
 
-        tableau_annuel = (
-            annuel * 100
-        ).round(2).to_frame("Rendement (%)")
+        c6.metric(
+            "Frais cumulés",
+            f'{resultat["total_frais"]:.2f} €'
+        )
 
-        tableau_annuel.index = tableau_annuel.index.year
-        st.dataframe(tableau_annuel, use_container_width=True)
+        c7.metric(
+            "Achats / ventes",
+            f'{resultat["nb_achats"]} / {resultat["nb_ventes"]}'
+        )
 
-    st.caption(
-        "Attention : les actions sélectionnées sont celles d'aujourd'hui. "
-        "Le backtest présente donc un biais de survivance. "
-        "Le CAC 40 est ici un indice de prix, sans réinvestissement "
-        "des dividendes. Les frais de courtage sont simulés à 0,10 %, "
-        "sans spread ni glissement de prix. Les fractions d'actions "
-        "sont autorisées."
-    )
+        c8.metric(
+            "Bénéfices réalisés",
+            f'{resultat["benefices_realises"]:.2f} €'
+        )
 
-except Exception as erreur:
-    st.error(f"Erreur pendant le backtest : {erreur}")
+        # -------------------------------------------------
+        # COURBE DU CAPITAL
+        # -------------------------------------------------
+
+        st.subheader("Evolution du capital")
+
+        fig, ax = plt.subplots(figsize=(11, 5))
+
+        ax.plot(
+            resultat["courbe"].index,
+            resultat["courbe"]["Capital"],
+            label="Stratégie"
+        )
+
+        ax.set_ylabel("Capital en euros")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        st.pyplot(fig)
+
+        plt.close(fig)
+
+        # -------------------------------------------------
+        # TRESORERIE ET ACTIONS
+        # -------------------------------------------------
+
+        derniere_ligne = resultat["courbe"].iloc[-1]
+
+        c1, c2 = st.columns(2)
+
+        c1.metric(
+            "Trésorerie disponible",
+            f'{derniere_ligne["Tresorerie"]:.2f} €'
+        )
+
+        c2.metric(
+            "Valeur des actions",
+            f'{derniere_ligne["Valeur actions"]:.2f} €'
+        )
+
+        # -------------------------------------------------
+        # POSITIONS OUVERTES
+        # -------------------------------------------------
+
+        st.subheader("Actions encore détenues")
+
+        if resultat["positions"].empty:
+
+            st.info("Aucune action détenue à la fin du backtest.")
+
+        else:
+
+            st.dataframe(
+                resultat["positions"],
+                use_container_width=True,
+                hide_index=True
+            )
+
+        # -------------------------------------------------
+        # HISTORIQUE DES OPERATIONS
+        # -------------------------------------------------
+
+        st.subheader("Historique des achats et ventes")
+
+        if resultat["transactions"].empty:
+
+            st.info("Aucune opération réalisée.")
+
+        else:
+
+            st.dataframe(
+                resultat["transactions"].sort_values(
+                    "Date",
+                    ascending=False
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            csv = resultat["transactions"].to_csv(
+                index=False
+            ).encode("utf-8-sig")
+
+            st.download_button(
+                "Télécharger les opérations en CSV",
+                csv,
+                "historique_backtest.csv",
+                "text/csv"
+            )
+
+        st.warning(
+            "Attention : le modèle ne vend jamais une action à perte. "
+            "Une position peut donc rester immobilisée longtemps ou perdre "
+            "une grande partie de sa valeur. Les fractions d'actions sont "
+            "autorisées. Les frais sont fixes, mais les impôts, les spreads "
+            "et le slippage ne sont pas intégrés. L'univers actuel crée "
+            "également un biais de survivance dans le backtest historique."
+        )
+
+    except Exception as erreur:
+
+        st.error(
+            f"Erreur pendant le backtest : {erreur}"
+        )
+
+else:
+
     st.info(
-        "Si l'erreur concerne les cours, réessaie dans quelques minutes. "
-        "Yahoo Finance peut temporairement limiter les téléchargements."
+        "Choisis tes paramètres à gauche, puis clique sur "
+        "LANCER LE BACKTEST."
     )
+
+    st.subheader("Les 20 entreprises suivies")
+
+    liste = pd.DataFrame([
+        {"Ticker": ticker, "Entreprise": nom}
+        for ticker, nom in UNIVERS.items()
+    ])
+
+    st.dataframe(
+        liste,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.markdown("""
+    **Principe de fonctionnement :**
+
+    1. Le programme analyse les tendances sur trois et six mois.
+    2. Il privilégie les actions au-dessus de leur moyenne mobile à 200 jours.
+    3. Il achète les meilleures candidates disponibles.
+    4. Il conserve chaque action jusqu'à ce que sa vente couvre les frais d'achat, les frais de vente et le bénéfice minimum demandé.
+    5. Après une vente, il rescane les entreprises et réinvestit la trésorerie disponible.
+    """)
