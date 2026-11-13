@@ -3,31 +3,21 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import date, timedelta
 
-try:
-    from streamlit_autorefresh import st_autorefresh
-    AUTO_REFRESH_AVAILABLE = True
-except ImportError:
-    AUTO_REFRESH_AVAILABLE = False
-
-
-# ==========================================================
+# =========================================================
 # CONFIGURATION
-# ==========================================================
+# =========================================================
 
 st.set_page_config(
-    page_title="Trading Intraday - Simulateur",
+    page_title="Backtest Trading 10 ans",
     page_icon="📈",
     layout="wide"
 )
 
 CAPITAL_INITIAL = 500.0
 NB_ACTIONS = 10
-COMMISSION = 0.001
-
-# 5 analyses par période de 24 heures
-REFRESH_INTERVAL = 17_280_000
+FRAIS = 0.001
 
 ACTIONS = {
     "AIR.PA": "Airbus",
@@ -53,674 +43,671 @@ ACTIONS = {
 }
 
 
-# ==========================================================
-# INITIALISATION DU PORTEFEUILLE
-# ==========================================================
+# =========================================================
+# TELECHARGEMENT DES DONNEES
+# =========================================================
 
-if "cash" not in st.session_state:
-    st.session_state.cash = CAPITAL_INITIAL
+def extraire_clotures(data):
 
-if "positions" not in st.session_state:
-    st.session_state.positions = {}
+    if data is None or data.empty:
+        return pd.DataFrame()
 
-if "transactions" not in st.session_state:
-    st.session_state.transactions = []
+    if isinstance(data.columns, pd.MultiIndex):
 
-if "initialise" not in st.session_state:
-    st.session_state.initialise = False
+        close = None
 
-if "market_data" not in st.session_state:
-    st.session_state.market_data = {}
+        for niveau in range(data.columns.nlevels):
 
-if "last_fetch" not in st.session_state:
-    st.session_state.last_fetch = None
+            if "Close" in data.columns.get_level_values(niveau):
 
-if "scan_count" not in st.session_state:
-    st.session_state.scan_count = 0
-
-
-# ==========================================================
-# TELECHARGEMENT DES COURS
-# ==========================================================
-
-def telecharger_donnees():
-
-    donnees = {}
-    erreurs = []
-
-    for ticker in ACTIONS:
-
-        try:
-            historique = yf.Ticker(ticker).history(
-                period="60d",
-                interval="1h",
-                auto_adjust=True,
-                timeout=15
-            )
-
-            if historique is None or historique.empty:
-                erreurs.append(ticker)
-                continue
-
-            if "Close" not in historique.columns:
-                erreurs.append(ticker)
-                continue
-
-            close = historique["Close"]
-
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
-
-            close = pd.to_numeric(
-                close,
-                errors="coerce"
-            ).dropna()
-
-            if len(close) >= 25:
-                donnees[ticker] = close
-
-            else:
-                erreurs.append(ticker)
-
-        except Exception as e:
-            erreurs.append(ticker)
-            print(f"Erreur {ticker}: {e}")
-
-    return donnees, erreurs
-
-
-# ==========================================================
-# ANALYSE DES ACTIONS
-# ==========================================================
-
-def analyser_actions(donnees):
-
-    resultats = []
-
-    for ticker, close in donnees.items():
-
-        if len(close) < 25:
-            continue
-
-        prix = float(close.iloc[-1])
-
-        if not np.isfinite(prix) or prix <= 0:
-            continue
-
-        variation_20h = (
-            prix / float(close.iloc[-21]) - 1
-        )
-
-        if len(close) >= 121:
-            variation_120h = (
-                prix / float(close.iloc[-121]) - 1
-            )
-        else:
-            variation_120h = (
-                prix / float(close.iloc[0]) - 1
-            )
-
-        rendements = close.pct_change().dropna()
-
-        volatilite = float(
-            rendements.tail(20).std()
-        )
-
-        if not np.isfinite(volatilite):
-            volatilite = 0.0
-
-        # Score combinant tendance courte et moyenne
-        score = (
-            0.60 * variation_20h
-            + 0.40 * variation_120h
-            - 0.50 * volatilite
-        )
-
-        resultats.append({
-            "Ticker": ticker,
-            "Action": ACTIONS[ticker],
-            "Prix (€)": prix,
-            "Variation 20h (%)": variation_20h * 100,
-            "Variation 120h (%)": variation_120h * 100,
-            "Volatilite (%)": volatilite * 100,
-            "Score": score
-        })
-
-    classement = pd.DataFrame(resultats)
-
-    if classement.empty:
-        return classement
-
-    classement = classement.sort_values(
-        "Score",
-        ascending=False
-    ).reset_index(drop=True)
-
-    return classement
-
-
-# ==========================================================
-# FRAIS DE TRANSACTION
-# ==========================================================
-
-def calculer_frais(montant):
-
-    return montant * COMMISSION
-
-
-# ==========================================================
-# ACHAT SIMULE
-# ==========================================================
-
-def acheter(ticker, prix, places_restantes):
-
-    if places_restantes <= 0:
-        return
-
-    cash = float(st.session_state.cash)
-
-    budget = cash / places_restantes
-
-    quantite = budget / (
-        prix * (1 + COMMISSION)
-    )
-
-    montant = quantite * prix
-    frais = calculer_frais(montant)
-
-    total = montant + frais
-
-    if total > cash:
-        return
-
-    if quantite <= 0:
-        return
-
-    st.session_state.cash -= total
-
-    st.session_state.positions[ticker] = {
-        "quantite": quantite,
-        "prix_achat": prix
-    }
-
-    st.session_state.transactions.append({
-        "Date": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "Type": "ACHAT",
-        "Action": ACTIONS[ticker],
-        "Ticker": ticker,
-        "Prix (€)": prix,
-        "Quantite": quantite,
-        "Montant (€)": montant,
-        "Frais (€)": frais
-    })
-
-
-# ==========================================================
-# VENTE SIMULEE
-# ==========================================================
-
-def vendre(ticker, prix):
-
-    if ticker not in st.session_state.positions:
-        return
-
-    position = st.session_state.positions[ticker]
-
-    quantite = position["quantite"]
-
-    montant = quantite * prix
-
-    frais = calculer_frais(montant)
-
-    produit_vente = montant - frais
-
-    st.session_state.cash += produit_vente
-
-    st.session_state.transactions.append({
-        "Date": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "Type": "VENTE",
-        "Action": ACTIONS[ticker],
-        "Ticker": ticker,
-        "Prix (€)": prix,
-        "Quantite": quantite,
-        "Montant (€)": montant,
-        "Frais (€)": frais
-    })
-
-    del st.session_state.positions[ticker]
-
-
-# ==========================================================
-# GESTION AUTOMATIQUE DU PORTEFEUILLE
-# ==========================================================
-
-def gerer_portefeuille(classement, donnees):
-
-    if classement.empty:
-        return
-
-    selection = classement.head(NB_ACTIONS)["Ticker"].tolist()
-
-    prix_actuels = {
-        ticker: float(series.iloc[-1])
-        for ticker, series in donnees.items()
-        if len(series) > 0
-    }
-
-    # Premier investissement
-    if not st.session_state.initialise:
-
-        nombre = min(
-            NB_ACTIONS,
-            len(selection)
-        )
-
-        for ticker in selection[:nombre]:
-
-            prix = prix_actuels.get(ticker)
-
-            if prix is not None:
-                acheter(
-                    ticker,
-                    prix,
-                    nombre - len(st.session_state.positions)
+                close = data.xs(
+                    "Close",
+                    axis=1,
+                    level=niveau
                 )
 
-        if st.session_state.positions:
-            st.session_state.initialise = True
+                break
 
-        return
+        if close is None:
+            return pd.DataFrame()
 
-    # Vente des actions qui ne sont plus selectionnees
-    anciennes_positions = list(
-        st.session_state.positions.keys()
+    else:
+
+        if "Close" not in data.columns:
+            return pd.DataFrame()
+
+        close = data["Close"]
+
+        if isinstance(close, pd.Series):
+            close = close.to_frame()
+
+    return close
+
+
+def telecharger_historique():
+
+    fin = date.today() + timedelta(days=1)
+    debut = fin - timedelta(days=365 * 10 + 10)
+
+    tickers = list(ACTIONS.keys())
+
+    donnees = yf.download(
+        tickers,
+        start=debut,
+        end=fin,
+        interval="1d",
+        auto_adjust=True,
+        group_by="column",
+        progress=False,
+        threads=True
     )
 
-    for ticker in anciennes_positions:
+    prix = extraire_clotures(donnees)
 
-        if ticker not in selection:
+    if prix.empty:
+        raise ValueError(
+            "Yahoo Finance n'a retourne aucun cours exploitable."
+        )
 
-            prix = prix_actuels.get(ticker)
+    prix = prix.rename_axis(columns="Ticker")
 
-            if prix is not None:
-                vendre(ticker, prix)
+    prix = prix.reindex(
+        columns=tickers
+    )
 
-    # Achat des nouvelles actions selectionnees
-    for ticker in selection:
+    prix = prix.apply(
+        pd.to_numeric,
+        errors="coerce"
+    )
 
-        if ticker in st.session_state.positions:
+    prix = prix.sort_index()
+    prix = prix[~prix.index.duplicated(keep="last")]
+    prix = prix.dropna(how="all")
+
+    benchmark_brut = yf.download(
+        "^FCHI",
+        start=debut,
+        end=fin,
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        threads=False
+    )
+
+    benchmark = extraire_clotures(benchmark_brut)
+
+    if benchmark.empty:
+        raise ValueError(
+            "Impossible de recuperer le CAC 40."
+        )
+
+    if isinstance(benchmark, pd.DataFrame):
+        benchmark = benchmark.iloc[:, 0]
+
+    benchmark = pd.to_numeric(
+        benchmark,
+        errors="coerce"
+    ).dropna()
+
+    return prix, benchmark
+
+
+# =========================================================
+# CALCUL DU SCORE
+# =========================================================
+
+def calculer_scores(prix):
+
+    rendement_20 = (
+        prix / prix.shift(20) - 1
+    )
+
+    rendement_120 = (
+        prix / prix.shift(120) - 1
+    )
+
+    rendements_journaliers = prix.pct_change(
+        fill_method=None
+    )
+
+    volatilite = rendements_journaliers.rolling(
+        window=20,
+        min_periods=20
+    ).std()
+
+    score = (
+        0.60 * rendement_20
+        + 0.40 * rendement_120
+        - 0.50 * volatilite
+    )
+
+    return score
+
+
+# =========================================================
+# CONSTRUCTION DU PORTEFEUILLE
+# =========================================================
+
+def construire_portefeuille(prix):
+
+    scores = calculer_scores(prix)
+
+    # Le signal du jour utilise uniquement les cours
+    # disponibles a la cloture de la veille.
+    signaux = scores.shift(1)
+
+    poids = pd.DataFrame(
+        0.0,
+        index=prix.index,
+        columns=prix.columns
+    )
+
+    for jour in prix.index:
+
+        classement = signaux.loc[jour].dropna()
+
+        # On exclut les actions sans cours disponible
+        disponibles = prix.loc[jour].dropna().index
+
+        classement = classement[
+            classement.index.isin(disponibles)
+        ]
+
+        if classement.empty:
             continue
 
-        if len(st.session_state.positions) >= NB_ACTIONS:
-            break
+        selection = classement.nlargest(
+            min(NB_ACTIONS, len(classement))
+        )
 
-        prix = prix_actuels.get(ticker)
+        nombre = len(selection)
 
-        if prix is not None:
+        poids.loc[
+            jour,
+            selection.index
+        ] = 1.0 / nombre
 
-            places = (
-                NB_ACTIONS
-                - len(st.session_state.positions)
-            )
-
-            acheter(ticker, prix, places)
+    return poids, scores
 
 
-# ==========================================================
-# INTERFACE
-# ==========================================================
+# =========================================================
+# BACKTEST
+# =========================================================
 
-st.title("📈 Simulateur de Trading Intraday")
+def lancer_backtest(prix, benchmark):
 
-st.caption(
-    "Portefeuille virtuel de 500 € - "
-    "Selection automatique et arbitrages simules"
+    poids, scores = construire_portefeuille(prix)
+
+    rendements = prix.pct_change(
+        fill_method=None
+    ).fillna(0)
+
+    # Rotation du portefeuille
+    turnover = poids.diff().abs().sum(axis=1)
+
+    # Premier investissement : 10 achats
+    if len(turnover) > 0:
+        turnover.iloc[0] = poids.iloc[0].abs().sum()
+
+    # Performance avant frais
+    performance_brute = (
+        poids * rendements
+    ).sum(axis=1)
+
+    # Commission sur achats et ventes
+    commissions_pct = turnover * FRAIS
+
+    performance_nette = (
+        performance_brute - commissions_pct
+    )
+
+    # Evolution du capital
+    capital = CAPITAL_INITIAL * (
+        1 + performance_nette
+    ).cumprod()
+
+    capital = capital.replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+    # Date du premier investissement effectif
+    dates_investies = poids.sum(axis=1)
+
+    dates_investies = dates_investies[
+        dates_investies > 0
+    ]
+
+    if dates_investies.empty:
+        raise ValueError(
+            "Pas assez de donnees pour constituer un portefeuille."
+        )
+
+    premiere_date = dates_investies.index[0]
+
+    capital = capital.loc[premiere_date:]
+
+    performance_nette = performance_nette.loc[
+        premiere_date:
+    ]
+
+    commissions_pct = commissions_pct.loc[
+        premiere_date:
+    ]
+
+    turnover = turnover.loc[premiere_date:]
+
+    poids = poids.loc[premiere_date:]
+
+    # Frais exprimes en euros
+    capital_precedent = capital.shift(1).fillna(
+        CAPITAL_INITIAL
+    )
+
+    frais_euros = (
+        capital_precedent * commissions_pct
+    )
+
+    total_frais = float(frais_euros.sum())
+
+    # Benchmark CAC 40
+    benchmark_aligne = benchmark.reindex(
+        capital.index
+    ).ffill()
+
+    benchmark_aligne = benchmark_aligne.dropna()
+
+    capital = capital.loc[
+        benchmark_aligne.index
+    ]
+
+    capital_initial_benchmark = float(
+        benchmark_aligne.iloc[0]
+    )
+
+    valeur_benchmark = (
+        CAPITAL_INITIAL
+        * (1 - FRAIS)
+        * benchmark_aligne
+        / capital_initial_benchmark
+    )
+
+    # Drawdown
+    sommet = capital.cummax()
+
+    drawdown = capital / sommet - 1
+
+    drawdown_max = float(drawdown.min() * 100)
+
+    # Rendement global
+    capital_final = float(capital.iloc[-1])
+
+    gain = capital_final - CAPITAL_INITIAL
+
+    rendement_global = (
+        capital_final / CAPITAL_INITIAL - 1
+    ) * 100
+
+    # Rendement annuel moyen
+    nombre_jours = (
+        capital.index[-1] - capital.index[0]
+    ).days
+
+    if nombre_jours > 0 and capital_final > 0:
+
+        rendement_annuel = (
+            (capital_final / CAPITAL_INITIAL)
+            ** (365.25 / nombre_jours) - 1
+        ) * 100
+
+    else:
+        rendement_annuel = 0.0
+
+    # Volatilite et ratio de Sharpe
+    volatilite_annuelle = (
+        performance_nette.std() * np.sqrt(252) * 100
+    )
+
+    if performance_nette.std() > 0:
+
+        sharpe = (
+            performance_nette.mean()
+            / performance_nette.std()
+            * np.sqrt(252)
+        )
+
+    else:
+        sharpe = 0.0
+
+    # Nombre de modifications de positions
+    modifications = poids.diff().fillna(
+        poids
+    )
+
+    nombre_ordres = int(
+        (modifications.abs() > 0.0000001).sum().sum()
+    )
+
+    # Tableau annuel
+    annuel = capital.groupby(
+        capital.index.year
+    ).last()
+
+    lignes_annuelles = []
+
+    precedent = CAPITAL_INITIAL
+
+    for annee, valeur in annuel.items():
+
+        rendement = (
+            valeur / precedent - 1
+        ) * 100
+
+        lignes_annuelles.append({
+            "Annee": int(annee),
+            "Capital final (€)": round(float(valeur), 2),
+            "Performance (%)": round(float(rendement), 2)
+        })
+
+        precedent = valeur
+
+    tableau_annuel = pd.DataFrame(
+        lignes_annuelles
+    )
+
+    return {
+        "capital": capital,
+        "benchmark": valeur_benchmark,
+        "drawdown": drawdown,
+        "scores": scores,
+        "poids": poids,
+        "capital_final": capital_final,
+        "gain": gain,
+        "rendement_global": rendement_global,
+        "rendement_annuel": rendement_annuel,
+        "drawdown_max": drawdown_max,
+        "volatilite": volatilite_annuelle,
+        "sharpe": sharpe,
+        "frais": total_frais,
+        "ordres": nombre_ordres,
+        "annuel": tableau_annuel,
+        "benchmark_final": float(valeur_benchmark.iloc[-1])
+    }
+
+
+# =========================================================
+# INTERFACE STREAMLIT
+# =========================================================
+
+st.title("📈 Backtest historique - Trading sur 10 ans")
+
+st.markdown(
+    """
+    Simulation d'une strategie de selection automatique
+    de 10 actions parmi 20 titres europeens.
+
+    Capital initial : **500 €**
+
+    Periode : **10 ans**
+
+    Frequence : **une decision par seance boursiere**
+    """
 )
 
-if AUTO_REFRESH_AVAILABLE:
+st.divider()
 
-    compteur = st_autorefresh(
-        interval=REFRESH_INTERVAL,
-        key="actualisation_automatique"
-    )
+if st.button(
+    "🚀 LANCER LE BACKTEST SUR 10 ANS",
+    type="primary",
+    use_container_width=True
+):
 
-    st.caption(
-        "Actualisation automatique : environ "
-        "5 fois par 24 heures."
-    )
+    try:
 
-else:
+        with st.spinner(
+            "Telechargement des 10 annees de donnees..."
+        ):
 
-    st.warning(
-        "Actualisation automatique indisponible. "
-        "Utilisez le bouton d'actualisation."
-    )
+            prix, benchmark = telecharger_historique()
 
+        with st.spinner(
+            "Calcul de la strategie et des arbitrages..."
+        ):
 
-# ==========================================================
-# COMMANDES
-# ==========================================================
-
-col_a, col_b = st.columns(2)
-
-with col_a:
-    actualiser = st.button(
-        "🔄 Analyser maintenant",
-        use_container_width=True
-    )
-
-with col_b:
-    reinitialiser = st.button(
-        "♻️ Reinitialiser les 500 €",
-        use_container_width=True
-    )
-
-if reinitialiser:
-
-    st.session_state.cash = CAPITAL_INITIAL
-    st.session_state.positions = {}
-    st.session_state.transactions = []
-    st.session_state.initialise = False
-    st.session_state.market_data = {}
-    st.session_state.last_fetch = None
-    st.session_state.scan_count = 0
-
-    st.rerun()
-
-
-# ==========================================================
-# TELECHARGEMENT ET ANALYSE
-# ==========================================================
-
-maintenant = datetime.now()
-
-dernier = st.session_state.last_fetch
-
-telecharger = (
-    dernier is None
-    or actualiser
-    or (maintenant - dernier) >= timedelta(
-        milliseconds=REFRESH_INTERVAL
-    )
-)
-
-if telecharger:
-
-    with st.spinner(
-        "Telechargement des cours et analyse des actions..."
-    ):
-
-        donnees, erreurs = telecharger_donnees()
-
-        if donnees:
-
-            classement = analyser_actions(donnees)
-
-            st.session_state.market_data = donnees
-            st.session_state.classement = classement
-            st.session_state.erreurs = erreurs
-            st.session_state.last_fetch = datetime.now()
-            st.session_state.scan_count += 1
-
-            gerer_portefeuille(
-                classement,
-                donnees
+            resultat = lancer_backtest(
+                prix,
+                benchmark
             )
 
-        else:
+        st.session_state.resultat_backtest = resultat
+        st.session_state.prix_backtest = prix
 
-            st.error(
-                "Impossible de recuperer les cours. "
-                "Yahoo Finance ne renvoie aucune donnee exploitable."
-            )
+        st.success(
+            "Backtest termine avec succes."
+        )
 
-else:
+    except Exception as e:
 
-    donnees = st.session_state.market_data
-    classement = st.session_state.get(
-        "classement",
-        pd.DataFrame()
-    )
-    erreurs = st.session_state.get("erreurs", [])
+        st.error(
+            f"Erreur pendant le backtest : {e}"
+        )
 
 
-# ==========================================================
+# =========================================================
 # AFFICHAGE DES RESULTATS
-# ==========================================================
+# =========================================================
 
-if not st.session_state.market_data:
+if "resultat_backtest" in st.session_state:
 
-    st.info(
-        "En attente des premieres donnees boursieres."
+    r = st.session_state.resultat_backtest
+
+    st.divider()
+
+    st.header("1. Resultat global")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Capital initial",
+        "500 €"
     )
 
-    st.stop()
-
-
-donnees = st.session_state.market_data
-
-classement = st.session_state.get(
-    "classement",
-    pd.DataFrame()
-)
-
-prix_actuels = {
-    ticker: float(series.iloc[-1])
-    for ticker, series in donnees.items()
-    if len(series) > 0
-}
-
-
-# Valeur du portefeuille
-valeur_positions = 0.0
-
-lignes_positions = []
-
-for ticker, position in st.session_state.positions.items():
-
-    prix = prix_actuels.get(
-        ticker,
-        position["prix_achat"]
+    c2.metric(
+        "Capital final",
+        f"{r['capital_final']:.2f} €"
     )
 
-    quantite = position["quantite"]
+    c3.metric(
+        "Gain / Perte",
+        f"{r['gain']:+.2f} €"
+    )
 
-    valeur = quantite * prix
+    c4.metric(
+        "Performance totale",
+        f"{r['rendement_global']:+.2f} %"
+    )
 
-    cout = quantite * position["prix_achat"]
+    c5, c6, c7, c8 = st.columns(4)
 
-    plus_value = valeur - cout
+    c5.metric(
+        "Rendement annualise",
+        f"{r['rendement_annuel']:.2f} %"
+    )
 
-    valeur_positions += valeur
+    c6.metric(
+        "Perte maximale",
+        f"{r['drawdown_max']:.2f} %"
+    )
 
-    lignes_positions.append({
-        "Action": ACTIONS[ticker],
-        "Ticker": ticker,
-        "Quantite": round(quantite, 5),
-        "Prix achat (€)": round(position["prix_achat"], 2),
-        "Cours actuel (€)": round(prix, 2),
-        "Valeur (€)": round(valeur, 2),
-        "Plus-value (€)": round(plus_value, 2)
+    c7.metric(
+        "Frais cumules",
+        f"{r['frais']:.2f} €"
+    )
+
+    c8.metric(
+        "Nombre de modifications",
+        str(r["ordres"])
+    )
+
+    st.divider()
+
+    # Evolution du capital
+    st.header("2. Evolution du capital")
+
+    graphique = pd.DataFrame({
+        "Strategie automatique": r["capital"],
+        "CAC 40": r["benchmark"]
     })
 
-
-cash = float(st.session_state.cash)
-
-valeur_totale = cash + valeur_positions
-
-benefice = valeur_totale - CAPITAL_INITIAL
-
-performance = (
-    benefice / CAPITAL_INITIAL
-) * 100
-
-
-# ==========================================================
-# INDICATEURS PRINCIPAUX
-# ==========================================================
-
-st.subheader("Mon portefeuille")
-
-c1, c2, c3, c4 = st.columns(4)
-
-c1.metric(
-    "Capital initial",
-    f"{CAPITAL_INITIAL:.2f} €"
-)
-
-c2.metric(
-    "Valeur actuelle",
-    f"{valeur_totale:.2f} €"
-)
-
-c3.metric(
-    "Benefice / Perte",
-    f"{benefice:+.2f} €",
-    f"{performance:+.2f} %"
-)
-
-c4.metric(
-    "Liquidites disponibles",
-    f"{cash:.2f} €"
-)
-
-st.divider()
-
-
-# ==========================================================
-# POSITIONS
-# ==========================================================
-
-st.subheader("Actions detenues")
-
-if lignes_positions:
-
-    tableau_positions = pd.DataFrame(
-        lignes_positions
+    st.line_chart(
+        graphique,
+        use_container_width=True
     )
 
+    st.caption(
+        "Comparaison sur la periode commune, avec "
+        "500 € de depart et frais d'entree de 0,10 %."
+    )
+
+    st.write(
+        f"Capital final CAC 40 : "
+        f"**{r['benchmark_final']:.2f} €**"
+    )
+
+    ecart = (
+        r["capital_final"] - r["benchmark_final"]
+    )
+
+    st.write(
+        f"Ecart strategie / CAC 40 : **{ecart:+.2f} €**"
+    )
+
+    st.divider()
+
+    # Drawdown
+    st.header("3. Risque et pertes maximales")
+
+    graphique_risque = (
+        r["drawdown"] * 100
+    ).to_frame("Drawdown (%)")
+
+    st.line_chart(
+        graphique_risque,
+        use_container_width=True
+    )
+
+    st.write(
+        f"Drawdown maximal : **{r['drawdown_max']:.2f} %**"
+    )
+
+    st.write(
+        f"Volatilite annualisee : **{r['volatilite']:.2f} %**"
+    )
+
+    st.write(
+        f"Ratio de Sharpe : **{r['sharpe']:.2f}**"
+    )
+
+    st.divider()
+
+    # Performance annuelle
+    st.header("4. Performance annee par annee")
+
     st.dataframe(
-        tableau_positions,
+        r["annuel"],
         use_container_width=True,
         hide_index=True
     )
 
-else:
+    st.bar_chart(
+        r["annuel"].set_index("Annee")[
+            "Performance (%)"
+        ]
+    )
+
+    st.divider()
+
+    # Derniere selection
+    st.header("5. Derniere selection des 10 actions")
+
+    prix = st.session_state.prix_backtest
+
+    derniere_date = r["poids"].index[-1]
+
+    derniere_selection = r["poids"].loc[
+        derniere_date
+    ]
+
+    derniere_selection = derniere_selection[
+        derniere_selection > 0
+    ]
+
+    lignes = []
+
+    for ticker, poids in derniere_selection.items():
+
+        lignes.append({
+            "Action": ACTIONS[ticker],
+            "Ticker": ticker,
+            "Poids (%)": round(float(poids) * 100, 2),
+            "Dernier cours (€)": round(
+                float(prix[ticker].dropna().iloc[-1]),
+                2
+            )
+        })
+
+    st.dataframe(
+        pd.DataFrame(lignes),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.caption(
+        "Cette selection correspond a la derniere allocation "
+        "calculee avec les informations de la veille."
+    )
+
+    st.divider()
+
+    st.header("6. Parametres du backtest")
+
+    st.write(f"Capital initial : {CAPITAL_INITIAL:.2f} €")
+    st.write(f"Univers : {len(ACTIONS)} actions")
+    st.write(f"Nombre de positions : {NB_ACTIONS}")
+    st.write(f"Commission par transaction : {FRAIS * 100:.2f} %")
+    st.write("Momentum court : 20 seances")
+    st.write("Momentum long : 120 seances")
+    st.write("Volatilite : 20 seances")
+    st.write("Reequilibrage : quotidien")
+
+    st.divider()
 
     st.warning(
-        "Aucune action achetee pour le moment."
-    )
+        """
+        LIMITES DU MODELE :
 
-
-# ==========================================================
-# CLASSEMENT DES ACTIONS
-# ==========================================================
-
-st.divider()
-
-st.subheader("Classement automatique des actions")
-
-st.write(
-    "Les actions sont classees selon leur tendance "
-    "sur 20 et 120 heures et leur volatilite."
-)
-
-if not classement.empty:
-
-    affichage = classement.copy()
-
-    affichage["Prix (€)"] = affichage["Prix (€)"].round(2)
-
-    for colonne in [
-        "Variation 20h (%)",
-        "Variation 120h (%)",
-        "Volatilite (%)"
-    ]:
-        affichage[colonne] = affichage[colonne].round(2)
-
-    affichage["Score"] = affichage["Score"].round(4)
-
-    st.dataframe(
-        affichage,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.subheader("Selection pour le prochain portefeuille")
-
-    selection = classement.head(NB_ACTIONS)
-
-    for _, ligne in selection.iterrows():
-
-        st.write(
-            f"**{ligne['Action']}** "
-            f"({ligne['Ticker']}) - "
-            f"Score : {ligne['Score']:.4f}"
-        )
-
-
-# ==========================================================
-# HISTORIQUE DES TRANSACTIONS
-# ==========================================================
-
-st.divider()
-
-st.subheader("Historique des achats et ventes")
-
-if st.session_state.transactions:
-
-    historique = pd.DataFrame(
-        st.session_state.transactions
-    )
-
-    st.dataframe(
-        historique.iloc[::-1],
-        use_container_width=True,
-        hide_index=True
-    )
-
-    total_frais = historique["Frais (€)"].sum()
-
-    st.metric(
-        "Total des commissions payees",
-        f"{total_frais:.2f} €"
+        - Les actions sont celles de la liste actuelle, ce qui
+          introduit un biais de survivance.
+        - Le CAC 40 utilise ici son indice de prix, sans
+          reinvestissement des dividendes.
+        - Les frais de 0,10 % ne comprennent pas les spreads,
+          taxes eventuelles et glissements de prix.
+        - Le modele autorise les fractions d'actions.
+        - Les donnees historiques Yahoo Finance peuvent
+          comporter des lacunes.
+        - Le backtest quotidien ne reproduit pas les cinq
+          decisions intraday du simulateur initial.
+        """
     )
 
 else:
 
     st.info(
-        "Les transactions apparaitront ici."
-    )
-
-
-# ==========================================================
-# INFORMATIONS TECHNIQUES
-# ==========================================================
-
-st.divider()
-
-st.caption(
-    f"Analyses effectuees : {st.session_state.scan_count}"
-)
-
-if st.session_state.last_fetch:
-
-    st.caption(
-        "Derniere analyse : "
-        + st.session_state.last_fetch.strftime(
-            "%d/%m/%Y a %H:%M:%S"
-        )
-    )
-
-if erreurs:
-
-    st.warning(
-        "Certaines actions n'ont pas fourni de donnees : "
-        + ", ".join(erreurs)
+        "Cliquez sur le bouton pour lancer votre premier "
+        "backtest historique."
     )
 
 st.caption(
-    "Simulation uniquement. Les performances passees "
-    "ne garantissent pas les performances futures. "
-    "Les cours proviennent de Yahoo Finance."
+    "Outil de simulation historique uniquement. "
+    "Aucun ordre boursier reel n'est execute."
 )
