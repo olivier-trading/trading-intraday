@@ -3,196 +3,117 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import datetime, timezone
 from streamlit_autorefresh import st_autorefresh
+from datetime import datetime
 
-# ============================================================
-# SIMULATEUR BOURSIER V2 - ARGENT STRICTEMENT FICTIF
-# AUCUNE CONNEXION A UN COURTIER - AUCUN ORDRE REEL
-# ============================================================
+# SIMULATEUR UNIQUEMENT : aucun ordre réel n'est envoyé.
 
-st.set_page_config(
-    page_title="Investisseur intelligent V2",
-    page_icon="📈",
-    layout="wide"
-)
+st.set_page_config(page_title="Simulateur boursier – 500 €", layout="wide")
 
-INITIAL_CAPITAL = 500.0
-MAX_POSITIONS = 10
-MIN_ORDER = 30.0
-REFRESH_MS = 4 * 60 * 60 * 1000 + 48 * 60 * 1000
+CAPITAL_INITIAL = 500.0
+FRAIS_TAUX = 0.001
+GLISSEMENT_TAUX = 0.0005
+NB_MAX_POSITIONS = 8
+ORDRE_MINIMUM = 30.0
+BENEFICE_NET_MIN = 0.50
+BENEFICE_NET_PCT = 0.006
+STOP_LOSS = 0.045
+TRAILING_STOP = 0.035
+SEUIL_ACHAT = 70
 
-# Entreprises sélectionnées : grandes sociétés établies.
-# Les cours sont téléchargés depuis Yahoo Finance.
-STOCKS = {
+ACTIONS = {
     "AI.PA": "Air Liquide",
     "SAF.PA": "Safran",
-    "SU.PA": "Schneider Electric",
-    "AIR.PA": "Airbus",
     "OR.PA": "L'Oréal",
     "MC.PA": "LVMH",
-    "SAN.PA": "Sanofi",
-    "BNP.PA": "BNP Paribas",
+    "SU.PA": "Schneider Electric",
     "TTE.PA": "TotalEnergies",
     "DG.PA": "Vinci",
+    "AIR.PA": "Airbus",
     "CAP.PA": "Capgemini",
-    "ACA.PA": "Crédit Agricole",
-    "ENGI.PA": "Engie",
-    "KER.PA": "Kering",
-    "RMS.PA": "Hermès",
-    "MSFT": "Microsoft",
+    "SAN.PA": "Sanofi",
+    "BNP.PA": "BNP Paribas",
+    "HO.PA": "Thales",
+    "VIE.PA": "Veolia",
+    "DSY.PA": "Dassault Systèmes",
+    "GLE.PA": "Société Générale",
+    "ASML.AS": "ASML",
+    "SAP.DE": "SAP",
+    "SIE.DE": "Siemens",
+    "ALV.DE": "Allianz",
+    "DTE.DE": "Deutsche Telekom",
+    "BAS.DE": "BASF",
+    "IBE.MC": "Iberdrola",
     "NVDA": "Nvidia",
+    "MSFT": "Microsoft",
     "GOOGL": "Alphabet",
-    "AAPL": "Apple",
     "AMZN": "Amazon",
     "META": "Meta",
     "AVGO": "Broadcom",
     "JPM": "JPMorgan",
-    "LLY": "Eli Lilly",
     "COST": "Costco",
-    "ORCL": "Oracle",
-    "CAT": "Caterpillar",
-    "AMD": "AMD",
-    "SAP.DE": "SAP",
-    "SIE.DE": "Siemens"
 }
 
-# ============================================================
-# INITIALISATION DU PORTEFEUILLE FICTIF
-# ============================================================
+ACTIONS_US = {"NVDA", "MSFT", "GOOGL", "AMZN", "META", "AVGO", "JPM", "COST"}
 
-if "cash" not in st.session_state:
-    st.session_state.cash = INITIAL_CAPITAL
-    st.session_state.positions = {}
-    st.session_state.history = []
-    st.session_state.initialized = True
-    st.session_state.last_bar = None
-    st.session_state.total_fees = 0.0
 
-# ============================================================
-# INDICATEURS TECHNIQUES
-# ============================================================
+def initialiser():
+    if "cash" not in st.session_state:
+        st.session_state.cash = CAPITAL_INITIAL
+        st.session_state.positions = {}
+        st.session_state.historique = []
+        st.session_state.derniere_action = {}
 
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(
-        alpha=1 / period,
-        min_periods=period,
-        adjust=False
+def rsi(serie, periode=14):
+    delta = serie.diff()
+    hausse = delta.clip(lower=0).ewm(
+        alpha=1 / periode, adjust=False
     ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / period,
-        min_periods=period,
-        adjust=False
+    baisse = (-delta.clip(upper=0)).ewm(
+        alpha=1 / periode, adjust=False
     ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = hausse / baisse.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 
-def analyze_stock(df):
-    if df is None or len(df) < 110:
-        return None
+def extraire_titre(data, ticker):
+    if data is None or data.empty:
+        return pd.DataFrame()
 
-    close = df["Close"].dropna()
+    if isinstance(data.columns, pd.MultiIndex):
+        for niveau in range(data.columns.nlevels):
+            if ticker in data.columns.get_level_values(niveau):
+                try:
+                    resultat = data.xs(
+                        ticker, axis=1, level=niveau
+                    )
+                    if isinstance(resultat, pd.DataFrame):
+                        return resultat.dropna(how="all")
+                except Exception:
+                    pass
+        return pd.DataFrame()
 
-    if len(close) < 110:
-        return None
+    return data.dropna(how="all")
 
-    sma20 = close.rolling(20).mean()
-    sma50 = close.rolling(50).mean()
-    sma100 = close.rolling(100).mean()
-    rsi = calculate_rsi(close)
-
-    price = float(close.iloc[-1])
-    previous_price = float(close.iloc[-2])
-
-    high100 = float(close.tail(100).max())
-    correction = (price / high100 - 1) * 100
-
-    # Qualité de tendance
-    trend_score = 0
-
-    if price > sma50.iloc[-1]:
-        trend_score += 10
-
-    if sma50.iloc[-1] > sma100.iloc[-1]:
-        trend_score += 15
-
-    if sma20.iloc[-1] > sma50.iloc[-1]:
-        trend_score += 10
-
-    # Recherche d'une correction raisonnable
-    correction_score = 0
-
-    if -12 <= correction <= -3:
-        correction_score = 25
-    elif -15 <= correction < -12:
-        correction_score = 10
-
-    # Recherche d'un début de reprise
-    momentum_score = 0
-
-    if price > previous_price:
-        momentum_score += 10
-
-    if close.iloc[-1] > sma20.iloc[-1]:
-        momentum_score += 10
-
-    current_rsi = float(rsi.iloc[-1])
-
-    if 40 <= current_rsi <= 65:
-        momentum_score += 10
-
-    # Liquidité et activité
-    volume_score = 0
-
-    if "Volume" in df.columns:
-        volumes = df["Volume"].dropna()
-
-        if len(volumes) >= 21:
-            average_volume = volumes.tail(21).mean()
-
-            if average_volume > 0:
-                if volumes.iloc[-1] >= average_volume * 1.1:
-                    volume_score = 10
-                else:
-                    volume_score = 5
-
-    score = (
-        trend_score
-        + correction_score
-        + momentum_score
-        + volume_score
-    )
-
-    return {
-        "price": price,
-        "score": min(score, 100),
-        "correction": correction,
-        "rsi": current_rsi,
-        "sma20": float(sma20.iloc[-1]),
-        "sma50": float(sma50.iloc[-1]),
-        "sma100": float(sma100.iloc[-1]),
-        "timestamp": close.index[-1]
-    }
-
-
-# ============================================================
-# TELECHARGEMENT DES COURS
-# ============================================================
 
 @st.cache_data(ttl=900, show_spinner=False)
-def download_market_data():
-    tickers = list(STOCKS.keys()) + ["EURUSD=X"]
+def telecharger_donnees():
+    tickers = list(ACTIONS.keys())
 
-    data = yf.download(
+    quotidien = yf.download(
         tickers,
-        period="3mo",
+        period="1y",
+        interval="1d",
+        auto_adjust=True,
+        group_by="ticker",
+        progress=False,
+        threads=True
+    )
+
+    horaire = yf.download(
+        tickers,
+        period="60d",
         interval="1h",
         auto_adjust=True,
         group_by="ticker",
@@ -200,505 +121,437 @@ def download_market_data():
         threads=True
     )
 
-    results = {}
+    change = yf.download(
+        "EURUSD=X",
+        period="5d",
+        interval="1d",
+        auto_adjust=True,
+        progress=False
+    )
 
-    for ticker in STOCKS:
-        try:
-            if isinstance(data.columns, pd.MultiIndex):
-                df = data[ticker].copy()
-            else:
-                continue
+    taux = None
+    if change is not None and not change.empty:
+        valeurs = change["Close"].dropna()
+        if not valeurs.empty:
+            taux = float(valeurs.iloc[-1])
 
-            df = df.dropna(subset=["Close"])
-
-            analysis = analyze_stock(df)
-
-            if analysis:
-                results[ticker] = analysis
-
-        except Exception:
-            continue
-
-    # Conversion USD vers EUR
-    try:
-        fx = data["EURUSD=X"]["Close"].dropna()
-        eurusd = float(fx.iloc[-1])
-    except Exception:
-        eurusd = None
-
-    if eurusd and eurusd > 0:
-        for ticker in results:
-            if ticker in [
-                "MSFT", "NVDA", "GOOGL", "AAPL", "AMZN",
-                "META", "AVGO", "JPM", "LLY", "COST",
-                "ORCL", "CAT", "AMD"
-            ]:
-                results[ticker]["price"] /= eurusd
-
-    return results
+    return quotidien, horaire, taux
 
 
-# ============================================================
-# CALCUL DU PORTEFEUILLE
-# ============================================================
-
-def portfolio_value(market):
-    value = st.session_state.cash
-
-    for ticker, pos in st.session_state.positions.items():
-        if ticker in market:
-            value += (
-                pos["quantity"] * market[ticker]["price"]
-            )
-        else:
-            value += pos["quantity"] * pos["last_price"]
-
-    return value
+def en_euros(ticker, prix, taux):
+    if ticker in ACTIONS_US:
+        if taux is None or taux <= 0:
+            return None
+        return prix / taux
+    return prix
 
 
-def execute_buy(ticker, analysis, budget, fee_rate):
-    price = analysis["price"]
+def analyser(ticker, quotidien, horaire, taux):
+    jour = extraire_titre(quotidien, ticker)
+    heure = extraire_titre(horaire, ticker)
 
-    fee = budget * fee_rate
-    invested = budget - fee
+    if jour.empty or heure.empty:
+        return None
 
-    quantity = invested / price
+    if "Close" not in jour or "Close" not in heure:
+        return None
 
-    st.session_state.cash -= budget
-    st.session_state.total_fees += fee
+    cj = jour["Close"].dropna()
+    ch = heure["Close"].dropna()
 
-    st.session_state.positions[ticker] = {
-        "name": STOCKS[ticker],
-        "quantity": quantity,
-        "buy_price": price,
-        "last_price": price,
-        "peak_price": price,
-        "buy_date": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "score": analysis["score"],
-        "invested": budget
+    if len(cj) < 100 or len(ch) < 30:
+        return None
+
+    dernier_jour = float(cj.iloc[-1])
+    sma20 = cj.rolling(20).mean().iloc[-1]
+    sma50 = cj.rolling(50).mean().iloc[-1]
+    sma100 = cj.rolling(100).mean().iloc[-1]
+
+    dernier = float(ch.iloc[-1])
+    precedent = float(ch.iloc[-2])
+    moyenne5 = float(ch.rolling(5).mean().iloc[-1])
+    rsi_actuel = float(rsi(ch).iloc[-1])
+
+    prix_euro = en_euros(ticker, dernier, taux)
+    if prix_euro is None:
+        return None
+
+    score = 0
+
+    tendance = sma50 > sma100 and dernier_jour > sma50 * 0.94
+    if tendance:
+        score += 35
+
+    correction = (
+        dernier_jour < sma20 * 1.015
+        and dernier_jour > sma50 * 0.94
+    )
+    if correction:
+        score += 25
+
+    reprise = dernier > moyenne5 and dernier > precedent
+    if reprise:
+        score += 25
+
+    momentum = 40 <= rsi_actuel <= 68
+    if momentum:
+        score += 15
+
+    return {
+        "nom": ACTIONS[ticker],
+        "prix": prix_euro,
+        "score": score,
+        "rsi": rsi_actuel,
+        "tendance": tendance,
+        "reprise": reprise,
+        "sous_moyenne": dernier < moyenne5,
     }
 
-    st.session_state.history.append({
+
+def commission(montant):
+    return montant * FRAIS_TAUX
+
+
+def acheter(ticker, a):
+    cash = st.session_state.cash
+
+    places = NB_MAX_POSITIONS - len(
+        st.session_state.positions
+    )
+
+    if places <= 0:
+        return
+
+    budget = min(cash / places, 80.0)
+
+    if budget < ORDRE_MINIMUM:
+        return
+
+    prix = a["prix"] * (1 + GLISSEMENT_TAUX)
+    frais_achat = commission(budget)
+
+    quantite = (budget - frais_achat) / prix
+    cout = quantite * prix + frais_achat
+
+    if quantite <= 0 or cout > cash:
+        return
+
+    st.session_state.cash -= cout
+
+    st.session_state.positions[ticker] = {
+        "nom": a["nom"],
+        "quantite": quantite,
+        "prix_achat": prix,
+        "cout": cout,
+        "plus_haut": a["prix"],
+        "date": datetime.now().strftime("%d/%m/%Y %H:%M"),
+    }
+
+    st.session_state.historique.insert(0, {
         "Date": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "Entreprise": STOCKS[ticker],
         "Opération": "ACHAT",
-        "Prix EUR": round(price, 2),
-        "Montant EUR": round(budget, 2),
-        "Résultat EUR": 0.0,
-        "Frais EUR": round(fee, 2)
+        "Société": a["nom"],
+        "Prix (€)": round(a["prix"], 2),
+        "Résultat net (€)": "",
+        "Motif": f"Signal d'achat : {a['score']}/100",
     })
 
 
-def execute_sell(ticker, price, reason, fee_rate):
-    pos = st.session_state.positions[ticker]
+def vendre(ticker, a, motif):
+    p = st.session_state.positions[ticker]
 
-    gross = pos["quantity"] * price
-    fee = gross * fee_rate
-    net = gross - fee
+    prix = a["prix"] * (1 - GLISSEMENT_TAUX)
+    montant = p["quantite"] * prix
+    montant_net = montant - commission(montant)
 
-    result = net - pos["invested"]
+    resultat = montant_net - p["cout"]
 
-    st.session_state.cash += net
-    st.session_state.total_fees += fee
+    st.session_state.cash += montant_net
 
-    st.session_state.history.append({
+    st.session_state.historique.insert(0, {
         "Date": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "Entreprise": pos["name"],
-        "Opération": "VENTE - " + reason,
-        "Prix EUR": round(price, 2),
-        "Montant EUR": round(net, 2),
-        "Résultat EUR": round(result, 2),
-        "Frais EUR": round(fee, 2)
+        "Opération": "VENTE",
+        "Société": p["nom"],
+        "Prix (€)": round(a["prix"], 2),
+        "Résultat net (€)": round(resultat, 2),
+        "Motif": motif,
     })
 
     del st.session_state.positions[ticker]
 
 
-# ============================================================
-# INTERFACE
-# ============================================================
-
-st.title("📈 Investisseur intelligent – Version 2")
-
-st.caption(
-    "SIMULATION UNIQUEMENT : argent fictif, aucun ordre réel."
-)
-
-st_autorefresh(
-    interval=REFRESH_MS,
-    key="automatic_refresh"
-)
-
-with st.sidebar:
-    st.header("Paramètres")
-
-    fee_rate = st.number_input(
-        "Frais par transaction (%)",
-        min_value=0.0,
-        max_value=2.0,
-        value=0.10,
-        step=0.05
-    ) / 100
-
-    stop_loss = st.slider(
-        "Stop-loss (%)",
-        2.0, 12.0, 5.0, 0.5
-    ) / 100
-
-    trailing_stop = st.slider(
-        "Stop suiveur (%)",
-        2.0, 12.0, 6.0, 0.5
-    ) / 100
-
-    take_profit = st.slider(
-        "Objectif de bénéfice (%)",
-        3.0, 20.0, 8.0, 0.5
-    ) / 100
-
-    min_score = st.slider(
-        "Score minimum pour acheter",
-        50, 95, 75
-    )
-
-    st.divider()
-
-    st.write("Capital initial : 500 €")
-    st.write("Positions maximales : 10")
-    st.write("Entreprises surveillées :", len(STOCKS))
-
-    automatic = st.toggle(
-        "Décisions fictives automatiques",
-        value=True
-    )
-
-    if st.button("Réinitialiser le portefeuille"):
-        st.session_state.cash = INITIAL_CAPITAL
-        st.session_state.positions = {}
-        st.session_state.history = []
-        st.session_state.last_bar = None
-        st.session_state.total_fees = 0.0
-        st.rerun()
-
-# ============================================================
-# RECUPERATION DES DONNEES
-# ============================================================
-
-if st.button("🔄 Actualiser les cours maintenant"):
-    st.cache_data.clear()
-    st.rerun()
-
-with st.spinner("Analyse des 30 entreprises en cours..."):
-    market = download_market_data()
-
-if not market:
-    st.error(
-        "Impossible de récupérer les cours. "
-        "Vérifie ta connexion ou réessaie plus tard."
-    )
-    st.stop()
-
-# ============================================================
-# DECISIONS AUTOMATIQUES - SIMULATION UNIQUEMENT
-# ============================================================
-
-new_timestamps = [
-    str(x["timestamp"]) for x in market.values()
-]
-
-current_bar = max(new_timestamps) if new_timestamps else None
-
-new_market_bar = (
-    current_bar is not None
-    and current_bar != st.session_state.last_bar
-)
-
-if automatic and new_market_bar:
-
-    # 1. Gestion des positions existantes
+def gerer_positions(analyses):
     for ticker in list(st.session_state.positions.keys()):
+        a = analyses.get(ticker)
 
-        if ticker not in market:
+        if not a:
             continue
 
-        pos = st.session_state.positions[ticker]
-        price = market[ticker]["price"]
+        p = st.session_state.positions[ticker]
+        p["plus_haut"] = max(p["plus_haut"], a["prix"])
 
-        pos["last_price"] = price
-        pos["peak_price"] = max(pos["peak_price"], price)
+        prix_sortie = a["prix"] * (1 - GLISSEMENT_TAUX)
+        montant = p["quantite"] * prix_sortie
+        gain_net = montant - commission(montant) - p["cout"]
 
-        variation = price / pos["buy_price"] - 1
-        drawdown = price / pos["peak_price"] - 1
+        seuil = max(
+            BENEFICE_NET_MIN,
+            p["cout"] * BENEFICE_NET_PCT
+        )
 
-        reason = None
+        rendement = a["prix"] / p["prix_achat"] - 1
+        recul = a["prix"] / p["plus_haut"] - 1
 
-        if variation <= -stop_loss:
-            reason = "STOP LOSS"
+        motif = None
 
-        elif drawdown <= -trailing_stop and variation > 0:
-            reason = "STOP SUIVEUR"
+        if gain_net >= seuil:
+            motif = f"Petit bénéfice net atteint : {gain_net:+.2f} €"
 
-        elif variation >= take_profit:
-            reason = "OBJECTIF ATTEINT"
+        elif rendement <= -STOP_LOSS:
+            motif = "Protection contre une baisse importante"
 
-        elif market[ticker]["score"] < 35:
-            reason = "DÉGRADATION DU SIGNAL"
+        elif recul <= -TRAILING_STOP and rendement > 0:
+            motif = "Sécurisation du gain"
 
-        if reason:
-            execute_sell(
-                ticker, price, reason, fee_rate
-            )
+        elif not a["tendance"] and a["sous_moyenne"]:
+            if gain_net > -1:
+                motif = "Tendance devenue défavorable"
 
-    # 2. Recherche de nouvelles opportunités
-    candidates = []
+        if motif:
+            vendre(ticker, a, motif)
 
-    for ticker, analysis in market.items():
 
+def chercher_achats(analyses):
+    candidats = []
+
+    for ticker, a in analyses.items():
         if ticker in st.session_state.positions:
             continue
 
-        if analysis["score"] >= min_score:
-            candidates.append((ticker, analysis))
+        if a["score"] >= SEUIL_ACHAT:
+            candidats.append((ticker, a))
 
-    candidates.sort(
+    candidats.sort(
         key=lambda x: x[1]["score"],
         reverse=True
     )
 
-    # 3. Achat des meilleures opportunités
-    for ticker, analysis in candidates:
-
-        if len(st.session_state.positions) >= MAX_POSITIONS:
+    for ticker, a in candidats:
+        if len(st.session_state.positions) >= NB_MAX_POSITIONS:
             break
 
-        portfolio = portfolio_value(market)
-
-        remaining_slots = (
-            MAX_POSITIONS - len(st.session_state.positions)
-        )
-
-        budget = min(
-            st.session_state.cash,
-            portfolio / MAX_POSITIONS
-        )
-
-        if budget < MIN_ORDER:
+        if st.session_state.cash < ORDRE_MINIMUM:
             break
 
-        if st.session_state.cash < MIN_ORDER:
-            break
+        aujourd_hui = datetime.now().strftime("%Y-%m-%d")
 
-        execute_buy(
-            ticker,
-            analysis,
-            budget,
-            fee_rate
-        )
+        if st.session_state.derniere_action.get(ticker) == aujourd_hui:
+            continue
 
-    st.session_state.last_bar = current_bar
+        avant = len(st.session_state.positions)
+        acheter(ticker, a)
 
-# ============================================================
-# MISE A JOUR DES PRIX DES POSITIONS
-# ============================================================
+        if len(st.session_state.positions) > avant:
+            st.session_state.derniere_action[ticker] = aujourd_hui
 
-for ticker, pos in st.session_state.positions.items():
-    if ticker in market:
-        pos["last_price"] = market[ticker]["price"]
 
-# ============================================================
-# TABLEAU DE BORD
-# ============================================================
+initialiser()
 
-total = portfolio_value(market)
-
-profit = total - INITIAL_CAPITAL
-
-invested = sum(
-    p["invested"]
-    for p in st.session_state.positions.values()
+# Actualisation toutes les deux heures environ.
+st_autorefresh(
+    interval=2 * 60 * 60 * 1000,
+    key="actualisation"
 )
+
+st.title("📈 Simulateur boursier – 500 €")
+st.caption(
+    "Simulation fictive : aucun compte bancaire ou courtier connecté."
+)
+
+with st.sidebar:
+    st.subheader("Fonctionnement")
+    st.write("Capital initial : **500 €**")
+    st.write("Frais estimés : **0,10 % par opération**")
+    st.write("Actions surveillées : **30**")
+    st.write("Positions simultanées : **8 maximum**")
+    st.write("Actualisation : **toutes les deux heures**")
+
+    if st.button("Recommencer la simulation"):
+        for cle in [
+            "cash",
+            "positions",
+            "historique",
+            "derniere_action"
+        ]:
+            st.session_state.pop(cle, None)
+
+        initialiser()
+        st.rerun()
+
+
+with st.spinner("Analyse des 30 sociétés en cours..."):
+    try:
+        quotidien, horaire, taux = telecharger_donnees()
+
+        analyses = {}
+
+        for ticker in ACTIONS:
+            resultat = analyser(
+                ticker,
+                quotidien,
+                horaire,
+                taux
+            )
+
+            if resultat:
+                analyses[ticker] = resultat
+
+        gerer_positions(analyses)
+        chercher_achats(analyses)
+
+    except Exception as erreur:
+        st.error(
+            f"Erreur lors de la récupération des cours : {erreur}"
+        )
+        analyses = {}
+
+
+valeur_actions = 0
+positions_affichees = []
+
+for ticker, p in st.session_state.positions.items():
+    a = analyses.get(ticker)
+
+    prix = a["prix"] if a else p["prix_achat"]
+    valeur = p["quantite"] * prix
+    gain = valeur - p["cout"]
+
+    valeur_actions += valeur
+
+    positions_affichees.append({
+        "Société": p["nom"],
+        "Investissement (€)": round(p["cout"], 2),
+        "Valeur actuelle (€)": round(valeur, 2),
+        "Gain latent (€)": round(gain, 2),
+        "Achetée le": p["date"],
+    })
+
+
+patrimoine = st.session_state.cash + valeur_actions
+resultat_global = patrimoine - CAPITAL_INITIAL
 
 c1, c2, c3, c4 = st.columns(4)
 
 c1.metric(
-    "Capital total",
-    f"{total:.2f} €",
-    f"{profit:+.2f} €"
-)
-
-c2.metric(
-    "Liquidités disponibles",
+    "Liquidités",
     f"{st.session_state.cash:.2f} €"
 )
 
+c2.metric(
+    "Valeur des actions",
+    f"{valeur_actions:.2f} €"
+)
+
 c3.metric(
-    "Positions ouvertes",
-    len(st.session_state.positions)
+    "Capital total",
+    f"{patrimoine:.2f} €"
 )
 
 c4.metric(
-    "Frais cumulés",
-    f"{st.session_state.total_fees:.2f} €"
+    "Résultat global",
+    f"{resultat_global:+.2f} €"
 )
+
 
 st.divider()
 
-# ============================================================
-# ANALYSE DES ENTREPRISES
-# ============================================================
+gauche, droite = st.columns([1.2, 1])
 
-st.subheader("1. Classement des entreprises")
+with gauche:
+    st.subheader("Positions ouvertes")
 
-rows = []
-
-for ticker, a in market.items():
-
-    if a["score"] >= min_score:
-        status = "ACHAT POTENTIEL"
-    elif a["score"] >= 60:
-        status = "SURVEILLER"
+    if positions_affichees:
+        st.dataframe(
+            pd.DataFrame(positions_affichees),
+            use_container_width=True,
+            hide_index=True
+        )
     else:
-        status = "ÉCARTER"
+        st.info(
+            "Aucune position ouverte. "
+            "Le simulateur attend une occasion intéressante."
+        )
 
-    rows.append({
-        "Entreprise": STOCKS[ticker],
-        "Ticker": ticker,
-        "Cours (€)": round(a["price"], 2),
-        "Score": a["score"],
-        "Correction (%)": round(a["correction"], 2),
-        "RSI": round(a["rsi"], 1),
-        "Décision": status
-    })
+with droite:
+    st.subheader("Stratégie")
 
-ranking = pd.DataFrame(rows).sort_values(
-    "Score", ascending=False
-)
-
-st.dataframe(
-    ranking,
-    use_container_width=True,
-    hide_index=True
-)
-
-# ============================================================
-# POSITIONS OUVERTES
-# ============================================================
-
-st.subheader("2. Positions ouvertes")
-
-if st.session_state.positions:
-
-    open_rows = []
-
-    for ticker, pos in st.session_state.positions.items():
-
-        price = pos["last_price"]
-
-        value = pos["quantity"] * price
-        result = value - pos["invested"]
-
-        open_rows.append({
-            "Entreprise": pos["name"],
-            "Prix achat (€)": round(pos["buy_price"], 2),
-            "Cours actuel (€)": round(price, 2),
-            "Investissement (€)": round(pos["invested"], 2),
-            "Valeur actuelle (€)": round(value, 2),
-            "Résultat latent (€)": round(result, 2),
-            "Variation (%)": round(
-                (price / pos["buy_price"] - 1) * 100, 2
-            )
-        })
-
-    st.dataframe(
-        pd.DataFrame(open_rows),
-        use_container_width=True,
-        hide_index=True
+    st.markdown(
+        """
+        1. Surveillance de 30 grandes entreprises.
+        2. Recherche d'une tendance de fond favorable.
+        3. Attente d'une correction puis d'un signe de reprise.
+        4. Achat progressif des meilleures occasions.
+        5. Vente dès qu'un petit bénéfice net est atteint.
+        6. Protection du capital en cas de baisse.
+        """
     )
 
-else:
-    st.info("Aucune position ouverte.")
-
-# ============================================================
-# HISTORIQUE DES OPERATIONS
-# ============================================================
-
-st.subheader("3. Historique des transactions")
-
-history = pd.DataFrame(st.session_state.history)
-
-if not history.empty:
-
-    st.dataframe(
-        history,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    realized = history.loc[
-        history["Opération"].str.startswith("VENTE"),
-        "Résultat EUR"
-    ].sum()
-
-    st.metric(
-        "Résultat cumulé des ventes réalisées",
-        f"{realized:+.2f} €"
-    )
-
-    csv = history.to_csv(
-        index=False
-    ).encode("utf-8-sig")
-
-    st.download_button(
-        "Télécharger l'historique CSV",
-        csv,
-        file_name="historique_simulation.csv",
-        mime="text/csv"
-    )
-
-else:
-    st.info("Aucune transaction réalisée.")
-
-# ============================================================
-# RESULTAT GLOBAL
-# ============================================================
 
 st.divider()
-st.subheader("4. Bilan de la stratégie")
+st.subheader("Actions intéressantes à surveiller")
 
-history = pd.DataFrame(st.session_state.history)
+if analyses:
+    tableau = []
 
-if not history.empty:
-    sales = history[
-        history["Opération"].str.startswith("VENTE")
-    ]
+    for ticker, a in analyses.items():
+        if ticker not in st.session_state.positions:
+            tableau.append({
+                "Société": a["nom"],
+                "Cours (€)": round(a["prix"], 2),
+                "Score": a["score"],
+                "RSI": round(a["rsi"], 1),
+                "Signal": (
+                    "Occasion possible"
+                    if a["score"] >= SEUIL_ACHAT
+                    else "Attendre"
+                ),
+            })
 
-    winners = (
-        sales["Résultat EUR"] > 0
-    ).sum()
-
-    losers = (
-        sales["Résultat EUR"] < 0
-    ).sum()
-
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric("Ventes gagnantes", int(winners))
-    col2.metric("Ventes perdantes", int(losers))
-
-    win_rate = (
-        winners / len(sales) * 100
-        if len(sales) else 0
+    tableau.sort(
+        key=lambda x: x["Score"],
+        reverse=True
     )
 
-    col3.metric("Taux de réussite", f"{win_rate:.1f} %")
+    st.dataframe(
+        pd.DataFrame(tableau),
+        use_container_width=True,
+        hide_index=True
+    )
+else:
+    st.warning(
+        "Les données ne sont pas disponibles pour le moment."
+    )
 
-st.write(
-    "Les performances affichées sont fictives et ne constituent "
-    "pas une prévision de rendement réel."
-)
+
+st.divider()
+st.subheader("Historique des opérations")
+
+if st.session_state.historique:
+    st.dataframe(
+        pd.DataFrame(st.session_state.historique),
+        use_container_width=True,
+        hide_index=True
+    )
+else:
+    st.info("Les achats et ventes simulés apparaîtront ici.")
+
 
 st.caption(
-    "Données de marché fournies par Yahoo Finance. "
-    "Les cours peuvent être retardés ou indisponibles. "
-    "Les décisions sont simulées et les données du portefeuille "
-    "sont conservées dans la session de l'application."
+    "Attention : les signaux sont des indicateurs techniques simples, "
+    "pas une analyse complète des comptes des entreprises. "
+    "Les données Yahoo Finance peuvent être retardées. "
+    "Les frais et le glissement sont des estimations. "
+    "Les positions et l'historique sont conservés dans la session "
+    "et peuvent être perdus lors d'un redémarrage de l'application. "
+    "Ce programme ne garantit aucun bénéfice."
 )
