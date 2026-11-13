@@ -1,5 +1,4 @@
 
-@st.cache_data(ttl=900, show_spinner=False)
 def telecharger_donnees():
     tickers = list(ACTIONS.keys())
 
@@ -28,37 +27,48 @@ def telecharger_donnees():
         period="5d",
         interval="1d",
         auto_adjust=True,
-        progress=False
+        progress=False,
+        threads=True
     )
 
     taux = None
 
-    if change is not None and not change.empty:
-        try:
+    try:
+        if change is not None and not change.empty:
+
+            close = None
+
             if isinstance(change.columns, pd.MultiIndex):
-                close = None
 
                 for niveau in range(change.columns.nlevels):
-                    if "Close" in change.columns.get_level_values(niveau):
+                    valeurs_niveau = change.columns.get_level_values(niveau)
+
+                    if "Close" in valeurs_niveau:
                         close = change.xs(
                             "Close",
                             axis=1,
                             level=niveau
                         )
                         break
+
             else:
-                close = change["Close"]
+                if "Close" in change.columns:
+                    close = change["Close"]
 
             if close is not None:
+
                 if isinstance(close, pd.DataFrame):
-                    valeurs = close.stack().dropna()
-                else:
+                    valeurs = close.iloc[:, 0].dropna()
+                elif isinstance(close, pd.Series):
                     valeurs = close.dropna()
+                else:
+                    valeurs = pd.Series(dtype=float)
 
                 if not valeurs.empty:
                     taux = float(valeurs.iloc[-1])
 
-        except Exception:
-            taux = None
+    except Exception as e:
+        print(f"Erreur récupération taux EUR/USD : {e}")
+        taux = None
 
     return quotidien, horaire, taux
