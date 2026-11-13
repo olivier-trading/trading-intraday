@@ -5,8 +5,8 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Simulateur intraday – 1 000 €", layout="wide")
-st.title("Simulateur de trading intraday")
+st.set_page_config(page_title="Simulateur intraday – 1 00 €", layout="wide")
+st.title("Simulateur de trading intraday capital de 100 euros")
 st.caption("Mode simulation uniquement — aucun ordre réel n'est envoyé à Trade Republic.")
 
 with st.sidebar:
@@ -14,7 +14,7 @@ with st.sidebar:
     ticker = st.text_input("Symbole Yahoo Finance", "AIR.PA")
     period = st.selectbox("Historique", ["5d", "1mo", "3mo", "6mo"], index=1)
     interval = st.selectbox("Intervalle", ["5m", "15m", "30m", "60m"], index=0)
-    capital = st.number_input("Capital initial (€)", min_value=100.0, value=1000.0, step=100.0)
+    capital = st.number_input("Capital initial (€)", min_value=100.0, value=100.0, step=100.0)
     fee = st.number_input("Frais fixes par ordre (€)", min_value=0.0, value=1.0, step=0.5)
     spread_pct = st.number_input("Spread estimé par côté (%)", min_value=0.0, value=0.05, step=0.01)
     slippage_pct = st.number_input("Glissement estimé par côté (%)", min_value=0.0, value=0.02, step=0.01)
